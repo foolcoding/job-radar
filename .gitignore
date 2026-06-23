@@ -1,0 +1,16 @@
+# 실행 결과물 / 개인 데이터 (절대 커밋 금지)
+output/
+*.local.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

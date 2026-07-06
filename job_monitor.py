@@ -39,6 +39,7 @@ TRACKS = {
         "jumpit": [(1,"백엔드"),(3,"풀스택")],
         "rallit": ("DEVELOPER_BACK_END","DEVELOPER_FULL_STACK"),
         "jk_queries": ("백엔드","자바 스프링","java"),
+        "saramin": ("백엔드 신입 자바","자바 스프링 신입 개발자"),
         "strong": lambda s: ("spring" in s) and (("java" in s and "javascript" not in s.replace("java script","")) or "kotlin" in s),
         "strong_label": "Java+Spring",
     },
@@ -50,10 +51,37 @@ TRACKS = {
         "jumpit": [(2,"프론트"),(3,"풀스택")],
         "rallit": ("DEVELOPER_FRONT_END","DEVELOPER_FULL_STACK"),
         "jk_queries": ("프론트엔드","react","웹 개발자"),
+        "saramin": ("프론트엔드 신입","react 신입 개발자"),
         "strong": lambda s: ("react" in s or "vue" in s or "next" in s) and ("typescript" in s or "react" in s),
         "strong_label": "React/Vue",
     },
 }
+
+
+# ---- 노이즈 필터 : 비개발 직무 · 모바일/프론트(백엔드 기준) · 시니어/경력 제외 ----
+# 각 소스가 직무·경력을 완벽히 거르지 못해(특히 랠릿 API, 잡코리아/사람인 검색) 제목 기반으로 보정한다.
+_MOBILE = ("안드로이드","android","ios","flutter","앱 개발","앱개발","react native","퍼블리","디자이너")
+_SENIOR = ("시니어","senior","테크리드","tech lead","리드 개발","대리급","과장","차장",
+           "5년","4년","3년 이상","경력 3","2~5","3~5","이상)")
+_NONDEV = ("영업","컨설","마케팅","디자인","퍼블리","교육생","부트캠프","아카데미","강사","상담",
+           "회계","인사","총무","금형","호텔","sm 모집","프로젝트 관리","관리업무","영업대표","생산",
+           "품질","조리","시설","경영지원","사무","물류","기획자","텔레마","건축","전기공","기계설계",
+           "간호","임상","약사","감리","devops","데브옵스","sre","qa 엔지니","qa엔지니","salesforce",
+           "세일즈포스","pm 및")
+def _has(title, words):
+    t=(title or "").lower(); return any(w in t for w in words)
+def is_mobile(title): return _has(title, _MOBILE)
+def is_senior(title):
+    if "신입" in (title or ""): return False   # '신입' 명시되면 유지
+    return _has(title, _SENIOR)
+def is_nondev(title): return _has(title, _NONDEV)
+def rl_keep(cfg, title, skills):
+    """랠릿 API의 filter.jobs가 부정확해 타 직무가 섞이므로 트랙 스택/키워드로 재필터한다."""
+    if is_mobile(title) or is_senior(title): return False
+    sks=[s.strip().lower() for s in (skills or [])]
+    if sks: return any(s in cfg["stack"] for s in sks)          # 스킬 있으면 트랙 스택 요구
+    tl=(title or "").lower()
+    return any(k in tl or k in (title or "") for k in cfg["kw"])  # 없으면 트랙 키워드
 
 
 def make_fetchers(sleep_sec):
@@ -106,6 +134,7 @@ def collect_wanted(cfg, get_json):
             if p.get("status")!="active": continue
             title=p.get("position") or p.get("title") or ""
             if not any(k in title.lower() or k in title for k in cfg["kw"]): continue
+            if is_mobile(title) or is_senior(title): continue   # 모바일앱·시니어 컷
             comp=(p.get("company") or {}).get("name","")
             loc=""
             if isinstance(p.get("address"),dict):
@@ -127,8 +156,10 @@ def collect_rallit(cfg, get_json):
         for p in items:
             comp=p.get("companyName") or (p.get("company") or {}).get("name","")
             title=p.get("title") or p.get("positionName") or ""
+            skills=p.get("jobSkillKeywords") if isinstance(p.get("jobSkillKeywords"),list) else []
+            if not rl_keep(cfg, title, skills): continue   # 타 직무·시니어 컷
             pid=p.get("id") or p.get("positionId")
-            stack="/".join(p.get("jobSkillKeywords",[])[:6]) if isinstance(p.get("jobSkillKeywords"),list) else "(상세확인)"
+            stack="/".join(skills[:6]) if skills else "(상세확인)"
             rows.append(("랠릿","신입",comp,title,stack,p.get("addressRegion","") or "",
                          p.get("endedAt","상시/확인") or "상시/확인",
                          f"https://www.rallit.com/positions/{pid}"))
@@ -164,6 +195,7 @@ def collect_jobkorea(cfg, get_text):
             vals=groups[gid]; title=vals[0]; comp=vals[1] if len(vals)>1 else "(회사확인)"
             key=(comp,title[:30])
             if key in seen: continue
+            if is_nondev(title) or is_mobile(title) or is_senior(title): continue  # 비개발·시니어 컷
             seen.add(key); cand.append((gid,comp,title))
     rows=[]
     for gid,comp,title in cand:
@@ -171,6 +203,32 @@ def collect_jobkorea(cfg, get_text):
         if tag=="경력": continue
         rows.append(("잡코리아",tag,comp,title,("경력:"+craw) if craw else "(상세확인)",
                      "(상세확인)","확인",f"https://www.jobkorea.co.kr/Recruit/GI_Read/{gid}"))
+    return rows
+
+
+def collect_saramin(cfg, get_text):
+    """사람인: 공개 API가 없어 검색 HTML을 파싱한다. 카드에서 (rec_idx, 제목, 회사)를 뽑고
+    비개발/모바일/시니어 직무를 제외한다. (정확한 경력 여부는 상세페이지 확인 권장 → '신입/확인' 태그)"""
+    rows=[]; seen=set()
+    for kw in cfg.get("saramin", cfg["jk_queries"]):
+        raw=get_text("https://www.saramin.co.kr/zf_user/search/recruit?searchType=search&searchword="
+                     +urllib.parse.quote(kw))
+        anchors=re.findall(r'class="job_tit"[^>]*>\s*(<a[^>]*>)', raw)
+        comps=re.findall(r'class="corp_name"[^>]*>\s*<a[^>]*>([^<]+)</a>', raw)
+        for i,a in enumerate(anchors):
+            rid=re.search(r'rec_idx=(\d+)', a); tit=re.search(r'title="([^"]+)"', a)
+            if not rid or not tit: continue
+            gid=rid.group(1); title=htmllib.unescape(tit.group(1)).strip()
+            comp=htmllib.unescape(comps[i]).strip() if i < len(comps) else "(회사확인)"
+            key=(comp,title[:30])
+            if key in seen: continue
+            seen.add(key)
+            if is_nondev(title) or is_mobile(title) or is_senior(title): continue
+            tl=title.lower()
+            if not (any(k in tl or k in title for k in cfg["kw"]) or "개발" in title or "engineer" in tl):
+                continue   # 도메인 검색어의 비개발 노이즈 컷 (트랙 키워드/개발 신호 요구)
+            rows.append(("사람인","신입/확인",comp,title,"(상세확인)","(상세확인)","확인",
+                         f"https://www.saramin.co.kr/zf_user/jobs/relay/view?rec_idx={gid}"))
     return rows
 
 
@@ -184,7 +242,8 @@ def run(track, out_dir, prefer, sleep_sec):
 
     status={}; rows=[]
     for name, fn, arg in [("점핏",collect_jumpit,get_json),("원티드",collect_wanted,get_json),
-                          ("랠릿",collect_rallit,get_json),("잡코리아",collect_jobkorea,get_text)]:
+                          ("랠릿",collect_rallit,get_json),("잡코리아",collect_jobkorea,get_text),
+                          ("사람인",collect_saramin,get_text)]:
         try:
             got=fn(cfg,arg); rows+=got; status[name]=f"OK({len(got)})"
         except Exception as e:
